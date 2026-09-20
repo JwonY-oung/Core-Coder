@@ -37,6 +37,8 @@ def _parse_args():
     p.add_argument("--demo", action="store_true", help="Run the offline scripted demo (no API key needed)")
     p.add_argument("-r", "--resume", metavar="ID", help="Resume a saved session")
     p.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
+    p.add_argument("--fallback", help="降级模型，逗号分隔，如 deepseek-chat,gpt-4o-mini")
+    p.add_argument("--budget", type=float, help="本次会话美元硬预算上限，如 0.50")
     return p.parse_args()
 
 
@@ -48,6 +50,10 @@ def main():
         raise SystemExit(run_demo())
 
     config = Config.from_env()
+    if args.fallback:
+        config.fallback_models = [m.strip() for m in args.fallback.split(",") if m.strip()]
+    if args.budget is not None:
+        config.budget_usd = args.budget
 
     # CLI args override env vars
     if args.model:
@@ -78,8 +84,16 @@ def main():
         model=config.model,
         api_key=config.api_key,
         base_url=config.base_url,
+
+        fallback_models=config.fallback_models,  # 新增
+        budget_usd=config.budget_usd,
+
         temperature=config.temperature,
         max_tokens=config.max_tokens,
+    )
+    # 降级发生时打印一条提示（llm.py 里预留的钩子）
+    llm._on_switch = lambda old, new, err: console.print(
+        f"[yellow]模型降级: {old} → {new} ({type(err).__name__})[/yellow]"
     )
     # consent layer: ask in the REPL, refuse in one-shot mode, --yes skips it
     if args.yes:
@@ -95,6 +109,8 @@ def main():
         permission=permission,
         hooks=load_hooks(),
     )
+
+    console.print(f"[dim]DEBUG tools: {[t.name for t in agent.tools]}[/dim]")
 
     # resume saved session
     if args.resume:
@@ -239,6 +255,9 @@ def _repl(agent: Agent, config: Config):
                 line += f"  (~${cost:.4f})"
             console.print(line)
             continue
+        if user_input == "/budget":
+            console.print(agent.llm.budget_status())
+            continue
         if user_input == "/model" or user_input.startswith("/model "):
             new_model = user_input[7:].strip() if user_input.startswith("/model ") else ""
             if new_model:
@@ -325,6 +344,7 @@ def _show_help():
         "  /model         Show current model\n"
         "  /model <name>  Switch model mid-conversation\n"
         "  /tokens        Show token usage\n"
+        "  /budget        Show USD budget status\n"
         "  /compact       Compress conversation context\n"
         "  /diff          Show files modified this session\n"
         "  /undo          Revert the most recent file change\n"

@@ -13,6 +13,7 @@ import subprocess
 import threading
 from typing import ClassVar
 
+from ..sandbox import SeccompSandbox, get_sandbox
 from .base import Tool
 
 # Track cwd across commands (Claude Code does this too). Thread-local, so that
@@ -60,7 +61,7 @@ class BashTool(Tool):
     }
 
     def execute(self, command: str, timeout: int = 120) -> str:
-        # safety check
+        # layer 1: regex blacklist for the obvious foot-guns
         warning = _check_dangerous(command)
         if warning:
             return f"⚠ Blocked: {warning}\nCommand: {command}\nIf intentional, modify the command to be more specific."
@@ -68,17 +69,29 @@ class BashTool(Tool):
         # use this thread's own tracked working directory
         cwd = getattr(_local, "cwd", None) or os.getcwd()
 
+        # layer 2: OS-level isolation. The backend turns the command into an
+        # argv to exec; `none` returns a sentinel telling us to use shell=True.
+        sandbox = get_sandbox()
+        argv, run_cwd = sandbox.wrap(command, cwd)
+        use_shell = argv[0] == "__shell__"
+        if use_shell:
+            argv = command
+
+        # seccomp installs its filter in the child via preexec_fn
+        preexec = SeccompSandbox.install_filter if sandbox.name == "seccomp" else None
+
         try:
             proc = subprocess.run(
-                command,
-                shell=True,
+                argv,
+                shell=use_shell,
                 check=False,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout,
-                cwd=cwd,
+                cwd=run_cwd,
+                preexec_fn=preexec,
             )
 
             # track cd commands so next command runs in the right place
