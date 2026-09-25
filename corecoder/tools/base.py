@@ -9,6 +9,7 @@ class Tool(ABC):
     name: str
     description: str
     parameters: dict  # JSON Schema for the function args
+    read_only: bool = False   # 默认是写；只读工具显式 opt-in
 
     @abstractmethod
     def execute(self, **kwargs) -> str:

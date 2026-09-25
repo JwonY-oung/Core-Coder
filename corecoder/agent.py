@@ -20,7 +20,7 @@ from .tools import ALL_TOOLS
 from .tools.agent import AgentTool
 from .tools.base import Tool
 from .tools.todo import TodoWriteTool
-
+from .mcp import load_mcp_tools
 
 class Agent:
     def __init__(
@@ -33,7 +33,19 @@ class Agent:
         hooks=None,
     ):
         self.llm = llm
-        self.tools = tools if tools is not None else ALL_TOOLS
+
+        if tools is not None:
+            self.tools = tools
+        else:
+            # 默认使用本地内置工具 + 动态加载的 MCP 工具
+            mcp_tools = load_mcp_tools()
+            self.tools = list(ALL_TOOLS) + mcp_tools
+
+        print(f"🤖 Agent 初始化完成，总工具数: {len(self.tools)}")
+        for t in self.tools:
+            if t.name.startswith("mcp__"):
+                print(f"   - 已挂载 MCP: {t.name}")
+
         self.permission = permission
         self.hooks = hooks
         self._tool_by_name = {t.name: t for t in self.tools}
@@ -166,31 +178,77 @@ class Agent:
         except Exception as e:  # noqa: BLE001
             return f"Error executing {tc.name}: {e}"
 
+    def _is_read_only(self, tc) -> bool:
+            tool = self._tool_by_name.get(tc.name)
+            return bool(getattr(tool, "read_only", False))
+
     def _exec_tools_parallel(self, tool_calls, on_tool=None) -> list[str]:
-        """Run multiple tool calls concurrently using threads.
+            """读工具并发跑；写工具串行且互斥。
 
-        This is inspired by Claude Code's StreamingToolExecutor which starts
-        executing tools while the model is still generating.  We simplify to:
-        when the model returns N tool calls at once, run them in parallel.
-        """
-        for tc in tool_calls:
-            if on_tool:
-                on_tool(tc.name, tc.arguments)
+            连续的只读调用（read_file/glob/grep/fetch_url…）不可能互相竞争，整体丢线程池；
+            一个写调用是「屏障」：先把之前排队的读全部跑完并收结果，再单独执行它。
+            这样 [读,写,读,写] 得到的结果顺序与完全串行一致，但相邻的读仍能并行，
+            对纯读批次是纯加速，对含写的批次只是不再让写之间并发。
+            """
+            for tc in tool_calls:
+                if on_tool:
+                    on_tool(tc.name, tc.arguments)
 
-        # hooks and consent are settled up front on this thread: prompting
-        # from pool workers would interleave several prompts on one terminal
-        results = [self._pre_hooks(tc) or self._permit(tc) for tc in tool_calls]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            futures = {
-                i: pool.submit(self._exec_tool, tc)
-                for i, tc in enumerate(tool_calls)
-                if results[i] is None
-            }
-            for i, future in futures.items():
-                results[i] = future.result()
-        for i in futures:
-            self._post_hooks(tool_calls[i], results[i])
-        return results
+            # hooks / consent 仍需在调用线程上一次性结算（池里弹提示会串在同一个终端上）
+            results: list = [self._pre_hooks(tc) or self._permit(tc) for tc in tool_calls]
+
+            def run(i: int) -> str:
+                return self._exec_tool(tool_calls[i])
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                batch: list[int] = []  # 待派发的只读调用下标
+
+                def flush():
+                    futures = {i: pool.submit(run, i) for i in batch if results[i] is None}
+                    for i, future in futures.items():
+                        results[i] = future.result()
+                    batch.clear()
+
+                for i, tc in enumerate(tool_calls):
+                    if results[i] is not None:
+                        continue  # 被 hook/consent 拦下，无需调度
+                    if self._is_read_only(tc):
+                        batch.append(i)  # 攒着，和相邻的读一起并发
+                    else:
+                        flush()  # 写是屏障：先排空在读
+                        results[i] = run(i)  # 写单独在调用线程上执行
+                flush()
+
+            for i in range(len(tool_calls)):
+                self._post_hooks(tool_calls[i], results[i])
+            return results
+
+
+    # def _exec_tools_parallel(self, tool_calls, on_tool=None) -> list[str]:
+    #     """Run multiple tool calls concurrently using threads.
+    #
+    #     This is inspired by Claude Code's StreamingToolExecutor which starts
+    #     executing tools while the model is still generating.  We simplify to:
+    #     when the model returns N tool calls at once, run them in parallel.
+    #     """
+    #     for tc in tool_calls:
+    #         if on_tool:
+    #             on_tool(tc.name, tc.arguments)
+    #
+    #     # hooks and consent are settled up front on this thread: prompting
+    #     # from pool workers would interleave several prompts on one terminal
+    #     results = [self._pre_hooks(tc) or self._permit(tc) for tc in tool_calls]
+    #     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+    #         futures = {
+    #             i: pool.submit(self._exec_tool, tc)
+    #             for i, tc in enumerate(tool_calls)
+    #             if results[i] is None
+    #         }
+    #         for i, future in futures.items():
+    #             results[i] = future.result()
+    #     for i in futures:
+    #         self._post_hooks(tool_calls[i], results[i])
+    #     return results
 
     def _answer_pending_tool_calls(self, tool_calls):
         """Backfill a tool reply for every call that didn't get one.

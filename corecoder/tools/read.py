@@ -8,6 +8,7 @@ from .base import Tool
 
 class ReadFileTool(Tool):
     name = "read_file"
+    read_only = True #只读
     description = (
         "Read a file's contents with line numbers. "
         "Always read a file before editing it."

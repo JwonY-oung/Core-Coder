@@ -6,6 +6,7 @@ from .base import Tool
 
 class FetchUrlTool(Tool):
     name = "fetch_url"
+    read_only = True
     description = (
         "The ONLY tool to access the internet and fetch web page content. If the user gives you a URL (http/https), you MUST use this tool to get the text. Do not use bash for web requests. "
         "Use this to read documentation, API responses, or web pages."
