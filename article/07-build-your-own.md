@@ -1,4 +1,4 @@
-# Fork CoreCoder，搭一个你自己的 coding agent
+woxz# Fork CoreCoder，搭一个你自己的 coding agent
 
 前六篇我们把 CoreCoder 拆开看了个遍。循环、工具、模型接口、上下文压缩、并发、子 agent、CLI，每个零件都摊在桌上看过了。这一篇我们把它们装回去，而且装成你自己的。
 

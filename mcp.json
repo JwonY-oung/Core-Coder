@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "amap-amap-sse": {
+      "url": "https://mcp.amap.com/sse?key=dc1febc86261120b18b2a4faf3b66276",
+      "type": "sse"
+    }
+  }
+}

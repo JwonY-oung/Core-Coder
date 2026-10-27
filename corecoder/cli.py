@@ -39,11 +39,35 @@ def _parse_args():
     p.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("--fallback", help="降级模型，逗号分隔，如 deepseek-chat,gpt-4o-mini")
     p.add_argument("--budget", type=float, help="本次会话美元硬预算上限，如 0.50")
+
+    # RAG 智能客服子命令：corecoder rag [选项]（参数由 rag.cli.add_rag_args 提供）
+    from .rag.cli import add_rag_args
+
+    sub = p.add_subparsers(dest="command")
+    rag = sub.add_parser(
+        "rag",
+        help="RAG 智能客服：基于知识库的问答",
+        description="基于本地知识库的问答客服（BM25 + 向量混合召回，RRF 融合）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "示例:\n"
+            "  corecoder rag --knowledge docs/                       # 交互问答\n"
+            "  corecoder rag -f manual.pdf -q \"如何退款？\"            # 单次提问\n"
+            "  corecoder rag --knowledge docs --index kb.json --save-index\n"
+            "  corecoder rag --index kb.json --list                  # 查看已索引来源\n"
+        ),
+    )
+    add_rag_args(rag)
     return p.parse_args()
 
 
 def main():
     args = _parse_args()
+
+    # RAG 智能客服模式（corecoder rag ...）
+    if args.command == "rag":
+        from .rag.cli import run_rag
+        raise SystemExit(run_rag(args))
 
     if args.demo:
         from .demo import run_demo

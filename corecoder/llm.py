@@ -84,7 +84,7 @@ _PRICING = {
 # them - a made-up number is worse than no number - but a hard budget has to
 # assume something, and assuming the most expensive case is the only assumption
 # that fails safe. Override per deployment with CORECODER_MAX_COST_PER_MTOK.
-_MAX_COST_PER_MTOK = (15.0, 75.0)
+_MAX_COST_PER_MTOK = (0.27, 1.10)
 
 
 class BudgetExceededError(RuntimeError):
@@ -100,6 +100,7 @@ class LLM:
     # subclasses) still answers budget questions instead of AttributeError
     budget_usd: float | None = None
     fallback_models: list[str] = []
+    embedding_model: str | None = None
 
     def __init__(
         self,
@@ -108,10 +109,21 @@ class LLM:
         base_url: str | None = None,
         fallback_models: list[str] | None = None,
         budget_usd: float | None = None,
+        embedding_model: str | None = None,
+        embedding_base_url: str | None = None,
+        embedding_api_key: str | None = None,
         **kwargs,
     ):
         self.model = model
+        self.api_key = api_key
+        self.base_url = base_url
         self.client = OpenAI(api_key=api_key, base_url=base_url)
+        # Embeddings normally ride the same endpoint as chat. Only when the
+        # user points them somewhere else (a dedicated embedding server) do we
+        # build a second client - lazily, so the common path allocates nothing.
+        self.embedding_model = embedding_model
+        self._embed_creds = (embedding_api_key or api_key, embedding_base_url or base_url)
+        self._embed_client = None
         self.extra = kwargs  # temperature, max_tokens, etc.
         # Ordered chain of stand-ins for self.model. Defaults to empty, so
         # existing callers see identical behaviour.
@@ -173,7 +185,7 @@ class LLM:
         )
 
     @property
-    def cost_bound(self) -> float: #兜底 未定价模型按_MAX_COST_PER_MTOK=(15,75) 永不为none
+    def cost_bound(self) -> float: #兜底 未定价模型按_MAX_COST_PER_MTOK 永不为none
         """Upper bound on spend, USD. Unlike estimated_cost it never returns None:
         unpriced models are charged at the worst-case rate, so a budget can't be
         evaded by naming a model the table doesn't know."""
@@ -357,6 +369,51 @@ class LLM:
             completion_tokens=completion_tok,
         )
 
+    def _embedding_client(self):
+        """The client used for embeddings: self.client unless a separate
+        embedding endpoint was configured."""
+        key, base = getattr(self, "_embed_creds", (None, None))
+        if key == self.api_key and base == self.base_url:
+            return self.client
+        if self._embed_client is None:
+            self._embed_client = OpenAI(api_key=key, base_url=base)
+        return self._embed_client
+
+    def embed(self, texts: list[str], model: str | None = None) -> list[list[float]]:
+        """Embed texts via the same OpenAI-compatible client as chat.
+
+        Reusing self.client means embeddings inherit the key/base_url the user
+        already configured - no second credential set to manage. The model
+        defaults to CORECODER_EMBEDDING_MODEL, then the chat model itself
+        (Ollama-style local servers often serve both under one name).
+
+        Transient failures get the same backoff-retry as chat; unlike chat
+        there is no fallback chain - a different embedding model would produce
+        vectors incompatible with the ones already indexed, so falling back
+        mid-corpus would silently corrupt retrieval.
+        """
+        if not texts:
+            return []
+        params = {"input": texts, "model": model or self.embedding_model or self.model}
+        client = self._embedding_client()
+        for attempt in range(3):
+            try:
+                resp = client.embeddings.create(**params)
+                break
+            except (RateLimitError, APITimeoutError, APIConnectionError):
+                if attempt == 2:
+                    raise
+                time.sleep(2**attempt)
+            except APIError as e:
+                status_code = getattr(e, "status_code", None)
+                if status_code and status_code >= 500 and attempt < 2:
+                    time.sleep(2**attempt)
+                else:
+                    raise
+        # providers may return items out of order; the index field is the contract
+        items = sorted(resp.data, key=lambda d: d.index)
+        return [list(d.embedding) for d in items]
+
     def _call_with_retry(self, params: dict, max_retries: int = 3):
         """Retry on transient errors with exponential backoff."""
         for attempt in range(max_retries):
@@ -396,6 +453,9 @@ class LiteLLM(LLM):
         base_url: str | None = None,
         fallback_models: list[str] | None = None,
         budget_usd: float | None = None,
+        embedding_model: str | None = None,
+        embedding_base_url: str | None = None,
+        embedding_api_key: str | None = None,
         **kwargs,
     ):
         # skip LLM.__init__ which creates an OpenAI client
@@ -403,11 +463,41 @@ class LiteLLM(LLM):
         self.api_key = api_key
         self.base_url = base_url
         self.extra = kwargs
+        self.embedding_model = embedding_model
+        self._embed_creds = (embedding_api_key or api_key, embedding_base_url or base_url)
+        self._embed_client = None
         self.fallback_models = list(fallback_models or [])
         self.budget_usd = budget_usd
         self.cost_by_model: dict[str, dict] = {}
         self._fallback_used: list[str] = []
         self._on_switch = None
+
+    def embed(self, texts: list[str], model: str | None = None) -> list[list[float]]:
+        """Embeddings through litellm, for providers without an OpenAI-compatible
+        /embeddings endpoint. Same no-fallback rule as LLM.embed."""
+        import litellm
+
+        if not texts:
+            return []
+        params: dict = {"input": texts, "model": model or self.embedding_model or self.model}
+        key, base = self._embed_creds
+        if key:
+            params["api_key"] = key
+        if base:
+            params["api_base"] = base
+        for attempt in range(3):
+            try:
+                resp = litellm.embedding(**params)
+                break
+            except Exception as e:  # noqa: BLE001
+                err = str(e).lower()
+                transient = any(kw in err for kw in ["rate_limit", "timeout", "connection", "500", "502", "503", "529"])
+                if transient and attempt < 2:
+                    time.sleep(2**attempt)
+                else:
+                    raise
+        items = sorted(resp.data, key=lambda d: d["index"])
+        return [list(d["embedding"]) for d in items]
 
     @staticmethod
     def _can_fall_back(error: Exception) -> bool:

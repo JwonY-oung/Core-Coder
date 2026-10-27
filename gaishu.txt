@@ -1,0 +1,755 @@
+# CoreCoder 项目深度解析（面试准备版）
+
+> 一句话定位：**"coding agent 界的 nanoGPT"** —— 用 ~1161 行纯 Python 复刻 Claude Code 的核心骨架，可读、可断点、可 fork。作者何宇峰（前 Moonshot AI/Kimi），项目原名 NanoCoder。
+
+---
+
+## 一、技术栈总览
+
+| 层次 | 技术 | 说明 |
+|---|---|---|
+| **语言/运行时** | Python 3.10+ | 用了 `X \| None` 联合类型、`from __future__ import annotations` |
+| **LLM 接入** | OpenAI SDK（`openai>=1.0`） | 走 OpenAI 兼容协议，一套接口接 DeepSeek/Qwen/Kimi/Ollama |
+| **多provider** | LiteLLM（可选依赖） | `pip install "corecoder[litellm]"`，路由 100+ provider |
+| **终端 UI** | `rich`（Markdown/Panel/Console）+ `prompt_toolkit`（REPL/历史/多行） | |
+| **配置** | `python-dotenv` + 环境变量 | |
+| **并发** | `concurrent.futures.ThreadPoolExecutor` | 多工具并行执行 |
+| **协议** | MCP（Model Context Protocol）JSON-RPC 2.0 | 自研 Stdio + SSE 双传输客户端 |
+| **打包** | hatchling + PyPI + GitHub Actions CI | |
+| **测试** | pytest（142 个测试） | |
+| **代码质量** | ruff（line-length 130） | |
+
+**核心依赖极简**：只有 4 个运行时依赖（openai / rich / prompt_toolkit / python-dotenv），这是刻意的设计——降低 fork 门槛。
+
+---
+
+## 二、架构全景（24 个文件）
+
+```
+corecoder/
+├── agent.py        (224行)  ★ 主循环 —— 整个项目的心脏
+├── llm.py          (267行)  ★ 模型层：流式、重试、成本统计、LiteLLM
+├── context.py      (210行)  ★ 三层上下文压缩
+├── cli.py          (348行)  REPL、斜杠命令、一次性模式
+├── permissions.py  (48行)   权限/consent 门
+├── prompt.py       (58行)   系统提示词
+├── session.py      (97行)   会话持久化
+├── hooks.py        (85行)   Pre/PostToolUse shell 钩子
+├── mcp.py          (396行)  MCP 客户端（Stdio + SSE）
+├── checkpoints.py  (38行)   文件撤销栈
+├── config.py       (55行)   配置
+├── demo.py         (100行)  离线脚本化 demo
+└── tools/          (9个工具)
+    ├── base.py     Tool 抽象基类
+    ├── bash.py     命令执行 + 危险检测 + cwd 跟踪
+    ├── read.py / write.py / edit.py
+    ├── glob_tool.py / grep.py
+    ├── todo.py     任务清单
+    ├── agent.py    子 agent 派生
+    └── fetch.py    URL 抓取
+```
+
+---
+
+## 三、核心逻辑深挖（面试重点）
+
+### 1. 主循环 —— `agent.py` 的 `chat()`
+
+这是**整个 agent 的本体**。本质是一个 `while` 循环：
+
+```
+user message → LLM(带tools) → 有tool_calls? → 执行 → 结果喂回 → 再问
+                            → 纯文本? → 返回给用户
+```
+
+**面试可深挖的工程细节（这些才是"真实世界的麻烦"）：**
+
+- **轮次上限** `max_rounds=50`：防止模型陷入无限工具调用死循环。
+- **单工具 vs 多工具分支**：单个直接执行；多个走 `_exec_tools_parallel`（线程池，`max_workers=8`）。
+- **参数预校验**（`_exec_tool` 第 172 行）：先用 `inspect.signature(tool.execute).bind(**tc.arguments)` 校验参数，**避免工具内部抛的 TypeError 被误判成"参数错误"**。这是一个很细的边界处理。
+- **异常隔离**：工具抛异常 → 转成 `"Error executing ..."` 字符串返回给模型，**永不杀死循环**。这是 agent 设计的核心哲学：**错误 是给模型看的观察结果，不是给程序看的崩溃**。
+- **KeyboardInterrupt 回填**（`_answer_pending_tool_calls`）：Ctrl+C 打断时，assistant 消息里已有 `tool_calls` 但缺 `tool` 回复 ，OpenAI API 会**拒绝**这种历史。所以必须给每个未回复的 tool_call 补一条 `[interrupted]`。**这是很多人踩过的坑。**
+- **系统提示词每轮重注入**（`_full_messages`）：plan_mode 提示和 todo 清单每轮重新拼进 system，保证模型看到的是**最新状态**而非 埋在旧 tool 结果里的过期副本。
+
+### 2. 工具系统 —— 抽象基类 + 注册表
+
+- `Tool` 是 ABC，三个类属性 `name/description/parameters`，一个 `execute()`，一个 `schema()` 生成 OpenAI function-calling schema。
+- `ALL_TOOLS` 是全局注册表，`Agent.__init__` 里 `{t.name: t for t in tools}` 建索引。
+- **`edit_file` 是 Claude Code 的关键创新**：不做整文件重写、不做行号 patch，而是**"唯一性搜索替换"**——`old_string` 必须在文件中**恰好出现一次**（`content.count(old_string)`），否则报错要求提供更多上下文。这消除了歧义，让编辑安全可审查。返回 unified diff  给模型看。
+- **`bash` 的安全闸**：`_DANGEROUS_PATTERNS` 正则黑名单（`rm -rf /`、fork bomb、`curl | sh`、`dd of=/dev/` 等）。输出截断保留** 头 6000 + 尾 3000**（保留最有用的信息）。
+- **cwd 跟踪用 `threading.local()`**：因为工具并行执行，两个 bash 调用不能共享一个全局 cwd，否则会 race。`cd a && cd b` 会逐段解析，相对路径基于上一段落点解析。
+
+### 3. 上下文压缩 —— `context.py` 三层策略
+
+对标 Claude Code 的 4 层，CoreCoder 实现 3 层，按 token 占比触发：
+
+| 层 | 触发阈值 | 策略 |
+|---|---|---|
+| Layer 1 `_snip_tool_outputs` | 50% | 把 >1500 字符的 tool 结果截成"前3行+后3行" |
+| Layer 2 `_summarize_old` | 70% | 用 LLM 总结旧对话，保留最近 8 条 |
+| Layer 3 `_hard_collapse` | 90% | 最后手段：只留 summary + 最近 4 条 |
+
+**面试杀手锏 —— 孤儿 tool 消息问题**（`_safe_split`）：
+切分历史时，如果切点正好落在一条 `role=tool` 消息上，这条 tool 消息就失去了它对应的 assistant `tool_calls` 消息，**OpenAI API 会直接报错**。所以 `_safe_split` 会**向前回退切点**，直到切点不是 tool 消息。作者说这是他做项目时真改过的 bug。
+
+**token 估算**：`len(text) // 3`（中英混合约 3 字符/token），不引入 tiktoken 依赖，保持轻量。
+
+### 4. LLM 层 —— `llm.py`
+
+- **流式解析**：`stream=True`，逐 chunk 累积 `content` 和 `tool_calls`。tool_calls 是**跨 chunk 分片**的（`index` 聚合，`arguments` 字符串拼接），最后 `json.loads` 解析。
+- **`stream_options={"include_usage": True}`**：OpenAI 扩展，拿 token 用量。**如果 provider 不支持会返回 400 BadRequest，此时降 级去掉该参数重试**——但只在 BadRequest 时降级，不在瞬时错误时降级（否则会双重重试）。
+- **指数退避重试** `_call_with_retry`：`RateLimitError/APITimeoutError/APIConnectionError` 重试，`2**attempt` 退避；5xx 重试，4xx 不重试。
+- **成本统计**：`_PRICING` 表（每百万 token 的 input/output 价），`estimated_cost` 属性算美元。
+- **LiteLLM 子类**：重写 `_call_with_retry`，用 `drop_params=True` 让 litellm 自动剥离不支持的参数。
+
+### 5. 权限系统 —— `permissions.py`（设计极优雅）
+
+- **纯逻辑，无 I/O**：`Permission` 类不碰终端，CLI 把 `ask` 回调传进来。可测试性极强。
+- **读写二分**：`READ_ONLY = {read_file, glob, grep, todo_write}` 直接放行；mutating 工具（edit/write/bash/agent）需要同意。
+- **三种裁决**：`once` / `always`（记住该工具，session 级）/ `deny`。
+- **无交互时拒绝而非阻塞**：一次性 `-p` 模式没人能批准，直接返回拒绝字符串（作为 tool 结果），**循环存活，模型可以绕路**。
+- **plan mode 优先级最高**：即使 `--yes`，plan mode 下 mutating 调用也被拒。
+
+### 6. MCP 客户端 —— `mcp.py`（项目里最"重"的模块）
+
+自研 JSON-RPC 2.0 客户端，支持两种传输：
+
+- **StdioMCPClient**：子进程 + stdin/stdout。后台 `_read_loop` 线程读响应，`threading.Condition` 做请求-响应配对（`_responses` dict + `notify_all`）。`_dead` 标志传播进程死亡。
+- **SSEMCPClient**：GET 长连接收 SSE 事件，POST 发请求。先等 `endpoint` 事件拿到 POST URL，再 `initialize`。响应通过 SSE 的 `message` 事件回来。
+- **工具命名** `mcp__<server>__<tool>`：**保证永不与内置工具冲突**。
+- **MCP 工具默认不在 READ_ONLY**：副作用未知，走 consent 门。
+- **容错**：服务器挂掉只让那一次调用返回错误字符串，**永不杀死循环**。`atexit` 注册清理。
+
+### 7. 子 agent —— `tools/agent.py`
+
+- 派生一个独立 `Agent`，**自己的上下文**，`max_rounds=20`。
+- **禁止递归**：`tools=[t for t in parent.tools if t.name != "agent"]`。
+- **共享父的 permission 和 hooks**：子 agent 也受同样的 consent 约束。
+- **共享 todo 清单**（简化设计，Claude Code 是每个子 agent 独立清单）。
+- 结果 >5000 字符截断，避免撑爆父上下文。
+
+### 8. 会话持久化 —— `session.py`（含安全细节）
+
+- JSON 存 `~/.corecoder/sessions/`。
+- **路径穿越防护**（面试亮点）：`_normalize_session_id` 剥离路径分隔符、正则白名单 `[^A-Za-z0-9._-]+` 替换、长度限制 100；`_session_path` 用 `.resolve()` 后校验 `root == path.parent`，**防止 `../../etc/passwd` 之类的恶意会话名**。
+
+### 9. Hooks —— `hooks.py`
+
+- `~/.corecoder/hooks.json` 定义 Pre/PostToolUse shell 命令。
+- 工具调用以 JSON 从 stdin 喂给 hook。
+- **Pre hook 用 exit code 2 否决**，stderr 作为理由回给模型。
+- **超时 10s**，hook 出错/挂起只警告跳过——**"hooks 辅助循环，永不杀死循环"**。
+
+### 10. Checkpoints —— `checkpoints.py`
+
+- 内存栈，`edit_file`/`write_file` 写前记录原字节。
+- `/undo` 弹出恢复（文件不存在则删除）。
+- **只跟踪两个文件写工具，bash 副作用不跟踪**（诚实的设计边界）。
+
+---
+
+## 四、贯穿全项目的设计哲学（面试时最能体现深度）
+
+1. **错误是观察，不是崩溃**：工具异常、MCP 挂掉、hook 失败、子 agent 出错——全部转成字符串返回给模型，循环永远存活。这是 agent 与普通程序的根本区别。
+
+2. **边界处做防御**：每个工具 `execute` 都 `try/except` 兜底返回 `"Error: ..."`，绝不把 traceback 抛给循环。
+
+3. **纯逻辑与 I/O 分离**：`Permission` 不碰终端，`ask` 回调注入——可测试、可嵌入。
+
+4. **每轮重注入状态**：system prompt、plan mode、todo 清单每轮重拼，避免模型看到过期状态。
+
+5. **刻意的简化即教学点**：README 明说"缺失的部分不是没做完，而是你 fork 的分叉点"。比如并行执行简化为"一次返回 N 个就并行跑"， 而非 Claude Code 的流式执行器。
+
+6. **依赖极简**：4 个运行时依赖，降低 fork 门槛。
+
+---
+
+## 五、高频面试问答准备
+
+**Q: agent 的本质是什么？**
+A: 一个 `while` 循环包着大模型 + 七八个工具。难的不是循环，是循环遇到真实世界后要处理的一切：打断、上下文塞满、并发、provider 抽风。
+
+**Q: 为什么 edit_file 用"唯一性搜索替换"而不是行号 patch？**
+A: 行号会因文件变化而失效；整文件重写浪费 token 且易覆盖。唯一性约束消除歧义，让编辑安全、可审查、可 diff。
+
+**Q: 上下文满了怎么办？**
+A: 三层渐进压缩（50% snip tool 输出 / 70% LLM 总结 / 90% 硬折叠），关键是切分时**不能产生孤儿 tool 消息**。
+
+**Q: 多个工具调用怎么处理？**
+A: 线程池并行（max_workers=8）。但 hooks 和 consent 必须在主线程**预先结算**，否则多个 prompt 会在一个终端上交错。cwd 用 thread-local 避免 race。
+
+**Q: 怎么保证安全？**
+A: 三层——bash 危险命令正则黑名单、consent 门（读写二分 + once/always/deny）、plan mode（只读，优先级高于 --yes）。会话名做路径穿越防护。
+
+**Q: 怎么接不同模型？**
+A: 走 OpenAI 兼容协议，换 `OPENAI_BASE_URL` + `OPENAI_API_KEY` 两个环境变量即可；非兼容的用 LiteLLM 后端。
+
+**Q: 流式 tool_calls 怎么解析？**
+A: tool_calls 跨 chunk 分片，按 `index` 聚合，`arguments` 字符串累加，最后统一 `json.loads`。
+
+---
+
+## 六、可以主动展示的"加分项"
+
+- 能说出 **142 个测试**、**1161 行引擎**、**4 个运行时依赖**这些具体数字（体现你真读过）。
+- 能讲 **孤儿 tool 消息**这个具体 bug（体现你理解 API 约束）。
+- 能讲 **`inspect.signature().bind()` 预校验参数**这个细节（体现边界意识）。
+- 能讲 **`stream_options` 只在 BadRequest 时降级**（体现对重试语义的精确理解）。
+- 能讲 **cwd 用 thread-local**（体现并发意识）。
+
+---
+
+需要我进一步做以下哪一项？
+1. 把某个模块（如 `agent.py` 主循环、MCP 客户端）画成**流程图/时序图**
+2. 针对某个子系统写**更深的追问式问答**（如"如果让你优化并行执行会怎么做"）
+3. 帮你**实际跑一遍** `corecoder --demo` 或测试，验证理解
+4. 整理成一份**可打印的面试速查卡**
+
+
+
+_____________________________________________________sandbox实现____________________________________________________________________________________________
+给 bash 上了**可插拔的真沙箱**，黑名单保留为第一层，OS 级隔离作为第二层。
+
+### 改动
+
+| 文件 | 内容 |
+|---|---|
+| `corecoder/sandbox.py`（新）| 4 个后端：`none` / `docker` / `bwrap` / `seccomp`，统一接口 `wrap(command, cwd) -> (argv, cwd)` |
+| `corecoder/tools/bash.py` | `execute()` 先过黑名单，再交给 `get_sandbox().wrap()` 决定怎么执行 |
+| `corecoder/config.py` | 新增 `sandbox` / `sandbox_image` / `sandbox_net` 配置 |
+| `tests/test_sandbox.py`（新）| 11 个测试，全绿 |
+
+### 各后端隔离强度
+
+- **`none`**（默认）— 原样 `shell=True`，行为完全不变，向后兼容。
+- **`seccomp`**（Linux）— 子进程 `preexec_fn` 里装 seccomp 过滤器，拦 `mount`/`ptrace`/`reboot`/`setns`/`unshare`/`bpf` 等逃逸类 syscall。**只过滤系统调用，文件系统仍全开**，是最弱的一档。需要 `pip install pyseccomp`。
+- **`bwrap`**（Linux）— bubblewrap：unshare 命名空间，只把工作目录 bind 成可写，其余只读，`--unshare-net` 断网。无需守护进程。
+- **`docker`**（跨平台，**Windows 上唯一能落地的**）— `docker run --rm`，挂载工作目录，`--network none`，`--cap-drop ALL`，`--security-opt no-new-privileges`，以宿主 uid 运行。
+
+### 用法
+
+```bash
+# 默认，无隔离
+corecoder
+
+# 容器隔离（Windows 推荐）
+set CORECODER_SANDBOX=docker
+set CORECODER_SANDBOX_IMAGE=python:3.12-slim
+corecoder
+
+# 需要联网装包时
+set CORECODER_SANDBOX_NET=1
+```
+
+后端在本机不可用时（比如 Windows 上选 `seccomp`）会**打印一行警告并降级到 `none`**，不会让 agent 崩掉。
+
+### 关于你的环境
+
+你现在在 **Windows 10** 上：seccomp 和 bubblewrap 都是 Linux 内核特性，**用不了**。所以实际能上的只有 **Docker 后端**（本机当前没装 docker，`get_sandbox('docker')` 会降级到 none）。要真正生效，装 Docker Desktop 后设 `CORECODER_SANDBOX=docker`  即可。
+
+### 两点说明
+
+1. 我跑全量测试时发现 **8 个失败是仓库原有的**（`git stash` 后同样失败）——原因是 Windows 上没有 `sh`/`sleep`、`.env` 覆盖了 config、README 行数过期，跟本次改动无关。
+2. `test_tool_count` 断言 8 但实际注册了 9 个工具，也是原有的不一致，我没动它。
+
+要不要我再加一个 `--sandbox` CLI 参数，或者把 docker 后端做成"首次调用时自动拉镜像"？
+You >
+
+
+---____________-----------------------------fallback和美元硬预算-----------------------------------------
+
+## 一、整体分层
+
+```
+env / CLI --fallback --budget
+        │
+   config.py  ──► Config.fallback_models / Config.budget_usd
+        │
+   cli.py     ──► LLM(model, fallback_models=..., budget_usd=...)
+        │           + llm._on_switch = 打印降级提示
+   agent.py   ──► 每轮 llm.chat(...)  ─► 内部走 fallback 链 / 预算门
+        │
+   /tokens /budget ──► estimated_cost / budget_status
+```
+
+核心机制全在 `llm.py`，其余是接线。分两块讲。
+
+---
+
+## 二、Fallback（模型降级）逻辑
+
+### 1. 链条构造（llm.py:225）
+
+```python
+chain = [self.model] + [m for m in self.fallback_models if m != self.model]
+```
+
+主模型打头，后面是去重过的 fallback。`for i, model in enumerate(chain)` 顺序尝试，**只前进不后退**——不会回到主模型。
+
+### 2. 什么错误才降级（llm.py:262 `_can_fall_back`）
+
+只降级"provider 侧、换个端点可能好"的失败：
+
+| 错误 | 降级? | 理由 |
+|---|---|---|
+| `APIConnectionError` / `APITimeoutError` / `RateLimitError` | ✅ | 网络/限流，换模型有意义 |
+| `APIError` 且 `status >= 500` | ✅ | 服务端故障 |
+| 4xx（BadRequest / 鉴权 / 超上下文） | ❌ | 是**这次请求**的问题，换模型同样被拒，重试只是放大失败 |
+| 其他异常 | ❌ | 不明来源，不冒险重放 |
+
+LiteLLM 版本（llm.py:411）因为不抛 openai 异常类型，改成先看 `status_code`，否则**从错误消息文本里 grep** `rate_limit/timeout/connection/overloaded` 或 ` 429/500/...`。这比 `isinstance` 脆弱，但覆盖了 litellm 的多 provider 差异。
+
+### 3. 最关键的设计：**"可重放"才允许降级**（llm.py:228-246）
+
+```python
+delivered = {"text": False}
+def record(text, delivered=delivered):
+    if on_token is not None:
+        delivered["text"] = True
+        on_token(text)
+...
+if i == len(chain)-1 or delivered["text"] or not self._can_fall_back(e):
+    raise
+```
+
+判据是**"用户屏幕上看没看到东西"**：
+
+- 在**第一个正文 token 到达前**失败 → 整个 turn 可重放，换下一个模型重来，用户无感。
+- 一旦 `on_token` 被调用过（真有正文上了屏）→ `delivered["text"]=True`，**立刻放弃降级、直接抛错**。因为重放会打印两份答案。
+- **没有 `on_token` 回调时**（context 压缩、一次性 summarise），即使已经流出一部分也仍算可重放——因为那些字节没显示、重试时被丢弃，是安全的。这也是 `context.py:155` 调 `llm.chat` 不带 `on_token` 的原因。
+- **tool-call 的 delta 不算数**：`_attempt` 里 tool_calls 是累加进 `tc_map` 的，从不调用 `on_token`，所以"只收到了半截工具调用就断流"仍然可以降级。
+
+> 注意一个细节：这个"未显示即可重放"的假设依赖 `on_token` 回调是**唯一**的副作用出口，且它要么全屏打印要么完全不调。当前 `delivered` 是按模型重置的（每轮循环新建），语义正确。
+
+### 4. token 记账按模型分桶（llm.py:120-123）
+
+```python
+self.cost_by_model: dict[str, dict] = {}
+```
+
+不做一个全局 token 计数器，而是 `{model: {prompt, completion}}`。原因注释写得很清楚：**降级会在会话中途换模型**，单一计数器会把整个会话按"当时那个模型"计价，严重失真。`total_prompt_tokens` 等属性改成对 buckets 求和，保证 agent/context/CLI 老 代码不用改。
+
+### 5. 降级提示钩子（llm.py:257 + cli.py:95）
+
+`_on_switch(old, new, err)` 在降级前调用，CLI 里绑定成打印 `模型降级: A → B (RateLimitError)`。注意它在 `over_budget()` 检查**之后**——若失败已把预算耗尽，就抛 `BudgetExceededError` 而不提示切换。
+
+### ⚠️ fallback 的一个边界问题
+
+`chain[i + 1]`（llm.py:258）在 `_on_switch` 里取下一个模型。因为循环条件是 `i == len(chain)-1` 会先 `raise`，所以这里 `i+1` 永远合法，不会越界——没问题。但要注意 `self._fallback_used`（llm.py:248）只是**记录**，从未被读取/展示。如果你想在 `/tokens` 或退出时告诉用户"本次会话降级过 N 次"，需要自己把 `_fallback_used` 接出来。
+
+---
+
+## 三、美元硬预算逻辑
+
+### 1. 两套价格，两种用途
+
+```
+estimated_cost (llm.py:162)          cost_bound (llm.py:175)
+─────────────────────────────        ─────────────────────────────
+给"人看"的估算                        给"预算门"用的上界
+表里全是已定价模型 → 精确值            永不为 None
+有一个未定价 → 返回 None             未定价模型按 _MAX_COST_PER_MTOK=(15,75) 兜底
+（部分定价会报一个自信的小数字，更糟）
+```
+
+这是这套实现最讲究的地方：**展示用精确、风控用保守**。两个指标分开，避免"用未知模型名绕过预算"——因为 `cost_bound` 对不认识的模型按最贵价计费，`over_budget()` 用 `cost_bound`，所以起个 `_PRICING` 表外的名字不但不会让预算失效，反而**更快**触发 。
+
+### 2. 预算门的位置（llm.py:209-215）
+
+```python
+if self.over_budget():
+    raise BudgetExceededError(...)   # 请求发出前
+```
+
+- **发请求前检查**：注释点明理由——钱花出去就收不回，发请求前是"叫停还免费"的最后时机。
+- `BudgetExceededError` 继承 `RuntimeError` 而非 `APIError`：provider 侧没出错，是本地账本停止授权。CLI 的 `except Exception` 能正常接住，REPL 不会挂。
+
+### 3. 计费口径（llm.py:157-160）
+
+```python
+bucket["prompt"] * rin/1e6 + bucket["completion"] * rout/1e6
+```
+
+按每百万 token 的 (input, output) 定价，**prompt 和 completion 分开计价**（输出通常贵 4-6 倍）。`over_budget` 用 `>=`：恰好花到上限即视为超。
+
+### 4. 失败后的二次检查（llm.py:249-256）
+
+降级前又查了一次 `over_budget()`：
+
+```python
+self._fallback_used.append(model)
+if self.over_budget():
+    raise BudgetExceededError(...) from e
+```
+
+因为**失败的那次尝试本身可能已经烧掉了剩余预算**（比如流了一半才断，usage 里的 prompt token 已经计费）。这里用 `from e` 保留原始 API 错误做上下文，而不是等到下一轮循环顶部再报——这样能同时看到"为什么降级"和"为什么停"。
+
+---
+
+## 四、值得注意的坑 / 未完成项
+
+1. **`_MAX_COST_PER_MTOK` 硬编码，注释撒谎**
+   llm.py:86 写"Override per deployment with `CORECODER_MAX_COST_PER_MTOK`"，但**没有任何地方读这个 env**。未定价模型的兜底价目前改不了，只能改源码。若要用 env 覆盖，需在 llm.py 里读 `os.getenv` 替换常量。
+
+2. **`cost_bound` 是"保守上界"不是"真实花费"**
+   只要用过任何未定价模型，`/budget` 显示的就是按 (15, 75) 计价的上界，可能远高于实际。这是**故意的 fail-safe**，但用户看到数字别当真。
+
+3. **定价表可能过期**
+   `_PRICING` 是硬编码静态表（gpt-5.5 等）。表里没有的模型走兜底价；厂商调价后表不会自动更新。
+
+4. **预算只在 `chat()` 入口拦，工具循环内部不拦**
+   `agent.py:87` 的 `for _ in range(self.max_rounds)` 每轮都调 `llm.chat`，所以每轮都被检查——这点没问题。但注意：**一次 `chat()` 内部的 token 累加发生在 `_attempt` 结束后**（llm.py:348），且 usage 是流末尾才到。所以"超预算"通常是**下一次** `chat()` 才拦得住，单次请求可能略微越过上限。这是流式 API 的固有约束，不是 bug。
+
+5. **`total_prompt_tokens` 的 setter 仍指向 `self.model`**（llm.py:135-137）
+   分桶后 getter 是求和、setter 却只写当前 `self.model` 的桶。有代码若 `llm.total_prompt_tokens = x` 赋值，语义和 getter 不对称。搜了一下**当前仓库没人用这两个 setter**，所以是潜伏隐患而非现行 bug。
+
+6. **`estimated_cost` 的 `None` 传播**
+   `/tokens`（cli.py:253）已正确处理 `cost is None`（不显示 `~$`）。但如果你以后在别处直接用 `estimated_cost` 做算术，要记得判空。
+
+---
+
+## 五、运行时行为小结
+
+- **降级触发时**：终端打印 `模型降级: A → B (错误类型)`，账单按 A、B 分别入桶，会话继续。
+- **预算超限时**：下一次 `chat()` 前抛 `BudgetExceededError`，REPL 显示 `Error: budget exhausted ...`，`/budget` 可查 `$已花 / $上限 (百分比)`。
+- **`/budget`**：无预算时显示 `Budget: none. Spent ~$X (worst case)`；有预算时显示用量和百分比。
+
+
+---------------------------------------------读并行 写串行------------------------------------------------------------------------------
+
+
+## 1. 给工具打上「读/写」标记
+
+`corecoder/tools/base.py`，给基类加一个类属性：
+
+```python
+class Tool(ABC):
+    name: str
+    description: str
+    parameters: dict
+    read_only: bool = False   # 默认是写；只读工具显式 opt-in
+```
+
+然后在各只读工具里声明（`read.py` / `glob_tool.py` / `grep.py` / `fetch.py`）：
+
+```python
+class ReadFileTool(Tool):
+    name = "read_file"
+    read_only = True          # 新增这一行
+    ...
+```
+
+对应地：`read_file`、`glob`、`grep`、`fetch_url` 标 `read_only = True`；`write_file`、`edit_file`、`bash`、`agent` 保持默认 `False`（写）。`todo_write` 只动内存、不动文件，且本来就在 `Permission.READ_ONLY` 里，为避免行为回退也标 `True`。
+
+> 单一事实来源的取舍：`Permission.READ_ONLY` 现在是「名字字符串集合」，可以保留不动，也可以让它跟 `Tool.read_only` 合并（见第 4 步）。
+
+## 2. 重写执行器：读走线程池，写做屏障
+
+`corecoder/agent.py`，把 `_exec_tools_parallel` 换成下面这版（调用点 `self._exec_tools_parallel(resp.tool_calls, on_tool)` 不用改）：
+
+```python
+def _is_read_only(self, tc) -> bool:
+    tool = self._tool_by_name.get(tc.name)
+    return bool(getattr(tool, "read_only", False))
+
+def _exec_tools_parallel(self, tool_calls, on_tool=None) -> list[str]:
+    """读工具并发跑；写工具串行且互斥。
+
+    连续的只读调用（read_file/glob/grep/fetch_url…）不可能互相竞争，整体丢线程池；
+    一个写调用是「屏障」：先把之前排队的读全部跑完并收结果，再单独执行它。
+    这样 [读,写,读,写] 得到的结果顺序与完全串行一致，但相邻的读仍能并行，
+    对纯读批次是纯加速，对含写的批次只是不再让写之间并发。
+    """
+    for tc in tool_calls:
+        if on_tool:
+            on_tool(tc.name, tc.arguments)
+
+    # hooks / consent 仍需在调用线程上一次性结算（池里弹提示会串在同一个终端上）
+    results: list = [self._pre_hooks(tc) or self._permit(tc) for tc in tool_calls]
+
+    def run(i: int) -> str:
+        return self._exec_tool(tool_calls[i])
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        batch: list[int] = []  # 待派发的只读调用下标
+
+        def flush():
+            futures = {i: pool.submit(run, i) for i in batch if results[i] is None}
+            for i, future in futures.items():
+                results[i] = future.result()
+            batch.clear()
+
+        for i, tc in enumerate(tool_calls):
+            if results[i] is not None:
+                continue                      # 被 hook/consent 拦下，无需调度
+            if self._is_read_only(tc):
+                batch.append(i)               # 攒着，和相邻的读一起并发
+            else:
+                flush()                       # 写是屏障：先排空在读
+                results[i] = run(i)           # 写单独在调用线程上执行
+        flush()
+
+    for i in range(len(tool_calls)):
+        self._post_hooks(tool_calls[i], results[i])
+    return results
+```
+
+要点：
+- **写做屏障**：`flush()` 会 `future.result()` 阻塞到在读全部完成，再执行写，保证「写之前的所有读」先于「写」完成；写之后的读又是新的一批。语义上等价于全串行，只是相邻读被并行化。
+- **写之间不再并发**：原先两个 `write_file` 会同时进池；现在每个写都走到 `run(i)` 单独执行，天然串行。
+- **`_exec_tool` 抛错已被它内部吞成字符串**，所以池里不会漏异常。
+
+## 3. 单调用分支不用改
+
+`chat()` 里 `len(resp.tool_calls) == 1` 的分支本来就是串行，保持不变。
+
+## 4.（可选）让权限层和标记保持一致
+
+`corecoder/permissions.py` 的 `READ_ONLY` 目前不含 `fetch_url`，意味着 `fetch_url` 会被当成写、每次都问 consent。若要一致，把它加上：
+
+```python
+READ_ONLY = frozenset({"read_file", "glob", "grep", "fetch_url", "todo_write"})
+```
+
+或者更进一步：把 `Permission.check` 改成接收 `read_only` 参数，从 `Tool` 实例读取，彻底去掉「名字集合」这份重复清单。
+
+---
+
+这样改完的效果：
+- `[read, read, read]` → 3 个并行（和现在一样）。
+- `[write, write]` → 串行（**这是相对现状的行为变化**
+
+------------------------------------------------------------------------------------------------------------------------------------
+
+## 一、核心思路（两种挂法，建议同时支持）
+
+1. **独立客服链路**（适合专门做客服问答）：`question → 向量检索 → 拼上下文 → LLM 生成回答`，不经过编码 Agent。
+2. **作为工具挂进现有 Agent**：把知识库检索做成一个 `kb_search` 工具，让 Agent 也能用（可选）。
+
+建议做成一个 `corecoder/rag/` 子包，核心逻辑复用现有 `LLM` 类，不用重复造。
+
+---
+
+## 二、新增文件
+
+都在 `corecoder/` 下新建：
+
+| 文件 | 作用 |
+|---|---|
+| `corecoder/rag/__init__.py` | 导出对外的 `RagService` / `KnowledgeBase` |
+| `corecoder/rag/loader.py` | 文档加载：`.txt` `.md` `.pdf`(pypdf) `.docx`(python-docx)，输出纯文本 |
+| `corecoder/rag/chunker.py` | 文本切块：按段落/固定长度+重叠，保留文档名/页码等元数据 |
+| `corecoder/rag/embedder.py` | 向量化：复用 OpenAI 兼容接口（新增一个 `llm.embed()` 或独立 client），本地可选 `sentence-transformers` |
+| `corecoder/rag/store.py` | 向量库封装：Chroma / FAISS / 或先用纯 NumPy 内存版，提供 `add(docs)` `search(query, top_k)` |
+| `corecoder/rag/retriever.py` | 检索：query 向量化 → top-k → 拼成上下文 prompt 片段 |
+| `corecoder/rag/service.py` | 客服核心：`ask(question, history)` = 检索 + LLM 生成；含「无相关知识时拒答/提示」的兜底 |
+| `corecoder/rag/cli_rag.py` | 客服的交互入口（独立于编码 REPL，简单 prompt 循环） |
+| `corecoder/rag/index_doc.py` | 建库脚本：把指定目录/文件导入知识库（`python -m corecoder.rag.index_doc docs/`） |
+
+> 数据目录建议放 `~/.corecoder/kb/` 或项目下 `kb/`，由 config 控制。
+
+---
+
+## 三、修改现有文件
+
+| 文件 | 改动内容 |
+|---|---|
+| `pyproject.toml` | ① `[project.dependencies]` 加：`chromadb`（或 `faiss-cpu`）、`pypdf`、`python-docx`、可选 `sentence-transformers`、`tiktoken`；② `[project.scripts]` 加一条客服入口，如 `corecoder-cs = "corecoder.rag.cli_rag:main"` |
+| `corecoder/config.py` | `Config` 增加 RAG 字段，并在 `from_env()` 里读取：<br>`kb_dir`、`kb_top_k`、`embedding_model`、`embedding_base_url`/`embedding_api_key`、`kb_threshold`（低于阈值走「不知道」）、`store_backend`(chroma/faiss/numpy) |
+| `corecoder/llm.py` | 加一个 `embed(texts: list[str]) -> list[list[float]]` 方法（轻量封装 `self.client.embeddings.create`），供 `embedder.py` 复用；这样 embedding 和 chat 共用一套 key/base_url/降级逻辑 |
+| `corecoder/permissions.py` | 如果做 `kb_search` 工具：把 `"kb_search"` 加入 `READ_ONLY` 集合 |
+| `corecoder/tools/__init__.py` | 新建 `corecoder/tools/rag.py`（`RagSearchTool`）后，把它加进 `ALL_TOOLS` |
+| `corecoder/cli.py` | 可选：REPL 加一个 `/kb <问题>` 命令，或加子命令跳转到客服入口 |
+
+---
+
+## 四、建议的最小版本（先跑通，再扩展）
+
+第一步只做这 4 个文件就能出效果，避免一上来被向量库和 PDF 解析拖住：
+
+1. `corecoder/rag/chunker.py` — 只支持 txt/md 的简单切块
+2. `corecoder/rag/embedder.py` — 直接调 `llm.embed()`（OpenAI 兼容）
+3. `corecoder/rag/store.py` — 内存 `numpy` 余弦相似度版（无外部依赖）
+4. `corecoder/rag/service.py` + `cli_rag.py` — 建库 + 问答循环
+
+跑通后再把 `store.py` 换成 Chroma/FAISS 持久化，`loader.py` 加 PDF/Word。
+
+---
+
+## 五、关键设计点提醒（这块容易踩坑）
+
+- **阈值兜底**：检索分数低于 `kb_threshold` 时，返回「我目前没有相关资料，请稍后再问/转人工」，别让 LLM 硬编答案。
+- **多轮上下文**：客服问答通常要带历史对话，`service.ask()` 里自己维护 `history`，不要复用 `Agent.messages`（那是编码 Agent 的工具消息格式）。
+- **检索 prompt 模板**：`system_prompt.py` 里可新增一个 `RAG_PROMPT`（规定：只用给定资料回答、资料没有就明说不知道），与编码用的 `system_prompt()` 分开。
+- **Embedding 模型要和 chunk 长度匹配**：常见 embedding 模型有 token 上限，切块别超。
+
+需要的话，我可以直接帮你把上面「最小版本」的代码写出来。
+You > 独立客服链路是什么意思 我要怎么去触发他?(简短的回答我)
+**独立客服链路** = 不经过 CoreCoder 的编码 Agent（不会去 read_file / edit_file / bash），而是直接走「提问 → 检索知识库 → LLM 回答」这条专线。它只做问答，不改代码。
+
+**触发方式**：单独一个入口命令，和 `corecoder` 并列，例如：
+
+```
+python -m corecoder.rag.cli_rag
+# 或安装后
+corecoder-cs
+```
+
+不嵌在现有 `You >` 输入框里（那里是给编码 Agent 用的）。当然如果你想让编码 Agent 也能查知识库，可以再加个 `kb_search` 工具，那就变成在 `You >` 里直接问——那是第二种可选方式。
+
+ 我要在当前项目中加入RAG智能客服, 做成一个 `corecoder/rag/` 子包，核心逻辑复用现有 `LLM` 类，不重复造 帮我实现
+
+---------
+ 完成。总结：
+
+**需要补充的只有 2 处，已全部修复：**
+
+1. **`embeddings.py`** — 文件末尾缺少 `__all__`，已添加
+2. **`rag/__init__.py`** — 未导出 `make_embedder`、`signature`、`OpenAIEmbedding`，已补上
+
+**其余 4 项确认无需修改：**
+- `retriever.py search()` 已有空查询防御（line 330）
+- `agent.py chat()` 的 `tools` 已通过 kwargs 转发给 `llm.chat()`
+- `knowledge.py` 无 `export_context()` 非必须，`kb.ask(q).context` 已覆盖
+- `pyproject.toml` line 42 已有 `[rag] = ["pypdf>=4.0", "python-docx>=1.1"]`
+You > 我现在要怎么接入知识库?需要注意哪些东西
+### 接入步骤
+
+**1. 准备知识文件**
+```
+docs/
+├── refund.md      # 退款政策
+├── shipping.md    # 配送说明
+└── faq.txt        # 常见问题
+```
+支持格式：`txt/md/rst/csv/json/pdf/docx`
+
+**2. 构建索引（离线，不耗 API）**
+```bash
+# 方式 A：CLI 一次性摄入
+corecoder rag --knowledge docs/ --index ~/.corecoder/kb/index.json --save-index
+
+# 方式 B：Python 代码
+from corecoder.rag import KnowledgeBase
+
+kb = KnowledgeBase()
+kb.load_dir("docs/")
+kb.save("~/.corecoder/kb/index.json")
+```
+
+**3. 启动客服**
+```bash
+# 交互模式
+corecoder rag --index ~/.corecoder/kb/index.json
+
+# 单次提问
+corecoder rag --index ~/.corecoder/kb/index.json -q "如何退款？"
+```
+
+---
+
+### 注意事项
+
+| 要点 | 说明 |
+|------|------|
+| **API Key** | 必须设置 `OPENAI_API_KEY` 或 `CORECODER_API_KEY`（调用 LLM 生成回答） |
+| **Embedding** | 默认 `hash`（离线免费），需语义检索时设 `--embedding openai` + `CORECODER_EMBEDDING_MODEL` |
+| **阈值控制** | `--threshold 0.05` 防止低质量匹配瞎编，低于阈值返回"未找到信息" |
+| **增量更新** | 再次运行 `load_dir()` 会自动跳过未变更文件（mtime+hash 检测） |
+| **切片参数** | 默认 chunk_size=1000, overlap=100，长文档可调整 `--chunk-size 800` |
+| **向量复用** | 保存的 index.json 包含向量，下次加载直接复用，不重复计费 |
+| **PDF/Docx** | 需 `pip install 'corecoder[rag]'` 安装 pypdf/python-docx |
+
+**最小可用配置：**
+```bash
+export OPENAI_API_KEY=sk-xxx
+corecoder rag --knowledge docs/ --threshold 0.05
+
+## RAG 智能客服项目分析
+
+### ✅ 完成度评估：基本完成，功能齐全
+
+RAG 子包包含 **7 个模块**，覆盖了完整的知识库问答链路：
+
+| 模块 | 功能 | 状态 |
+|------|------|------|
+| `embeddings.py` | 向量嵌入（Hash 离线 + OpenAI API） | ✅ |
+| `retriever.py` | BM25 + 向量混合检索（RRF 融合） | ✅ |
+| `loader.py` | 文档加载（txt/md/csv/json/pdf/docx） | ✅ |
+| `knowledge.py` | KnowledgeBase（索引管理、持久化） | ✅ |
+| `agent.py` | RAGAgent（问答 Agent，含对话历史） | ✅ |
+| `cli.py` | CLI 入口（交互式 REPL + 一次性问答） | ✅ |
+| `index_doc.py` | 离线索引构建器（独立于聊天） | ✅ |
+
+**核心特性：**
+- **混合检索**：BM25（关键词）+ 向量（语义），RRF 融合排序
+- **多格式支持**：txt/md/rst/csv/json/pdf/docx
+- **离线可用**：默认 HashEmbedding 无需 API Key
+- **索引持久化**：JSON bundle 可保存/加载，避免重复嵌入
+- **拒答机制**：低于阈值直接回复"未找到信息"，不 hallucinate
+- **来源引用**：回答附带出处标签
+- **对话历史**：支持上下文追问（最多 6 轮）
+- **增量更新**：`.add()` / `.forget()` 热更新知识库
+
+---
+
+### 🚀 启动方式
+
+#### 方式一：交互式问答（推荐）
+
+```bash
+# 先构建索引（首次）
+python -m corecoder.rag.index_doc docs/ --index ~/.corecoder/kb/index.json
+
+# 然后进入交互模式
+
+
+# 或
+corecoder rag --index ~/.corecoder/kb/index.json
+```
+
+#### 方式二：一次性提问
+
+```bash
+corecoder rag --knowledge docs/ -q "如何退款？"
+```
+
+#### 方式三：添加单个文件
+
+```bash
+corecoder rag -f manual.pdf -f faq.md
+```
+
+#### 交互式 REPL 命令
+
+| 命令 | 作用 |
+|------|------|
+| `/sources` | 列出已索引来源 |
+| `/add FILE` | 运行时添加文件 |
+| `/rm SOURCE` | 删除来源 |
+| `/save` | 保存索引到磁盘 |
+| `/tokens` | 查看用量 |
+| `/stats` | 查看统计 |
+| `/reset` | 清空对话 |
+| `/help` | 帮助 |
+
+---
+
+### ⚙️ 前置条件
+
+你的 `.env` 已经配置好了（阿里云百炼 API），但需要安装可选依赖以支持 PDF/Word：
+
+```bash
+pip install 'corecoder[rag]'   # 安装 pypdf + python-docx
+```
+
+如果只想用 txt/md 等纯文本，现有依赖就够了。
+
+---
+
+### 📝 注意事项
+
+1. **API Key 已配置** — 你的 `.env` 里有 `OPENAI_API_KEY`，RAG 会复用这个 key
+2. **模型是 `qwen3.7-flash-2026-07-15`** — 通过阿里云百炼 API 调用
+3. **默认使用 HashEmbedding**（离线），不需要额外的 embedding API
+4. **知识库目录** — 当前 `docs/` 下有 `faq.txt`、`refund.md`、`shipping.md` 三个文件，可以直接用
